@@ -4,8 +4,15 @@
 #import <UIKit/UIKit.h>
 #import <objc/message.h>
 #import <dlfcn.h>
+#import "MCPLogger.h"
 
-#define MCP_AX_NODE_LOG(fmt, ...) NSLog(@"[witchan][ios-mcp][AXNodeSource] " fmt, ##__VA_ARGS__)
+#define MCP_AX_NODE_LOG(fmt, ...) do { \
+    if ([MCPLogger isDebugLoggingEnabled]) { \
+        NSString *_iosmcp_log = [NSString stringWithFormat:(@"[AXNodeSource] " fmt), ##__VA_ARGS__]; \
+        NSLog(@"[witchan][ios-mcp]%@", _iosmcp_log); \
+        [MCPLogger logMessage:_iosmcp_log]; \
+    } \
+} while (0)
 
 static const BOOL MCPAXNodeSourceEnableNumericSampledHitMerge = YES;
 

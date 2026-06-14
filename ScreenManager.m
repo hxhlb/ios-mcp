@@ -1,8 +1,17 @@
 #import "ScreenManager.h"
+#import "MCPLogger.h"
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+
+#define SCREEN_LOG(fmt, ...) do { \
+    if ([MCPLogger isDebugLoggingEnabled]) { \
+        NSString *_iosmcp_log = [NSString stringWithFormat:(@"[Screen] " fmt), ##__VA_ARGS__]; \
+        NSLog(@"[witchan][ios-mcp]%@", _iosmcp_log); \
+        [MCPLogger logMessage:_iosmcp_log]; \
+    } \
+} while (0)
 
 typedef struct __IOSurface *IOSurfaceRef;
 typedef UIImage *(*UICreateScreenUIImageFunc)(void);
@@ -258,7 +267,7 @@ __attribute__((constructor)) static void _resolveScreenImageFunc(void) {
     dispatch_block_t block = ^{
         payload = [self privateScreenshotPayload];
         if (!payload) {
-            NSLog(@"[witchan][ios-mcp] Private screenshot APIs produced no encodable image, falling back to window capture");
+            SCREEN_LOG(@"Private screenshot APIs produced no encodable image, falling back to window capture");
             UIImage *image = [self fallbackScreenshotImage];
             payload = [self payloadByEncodingImage:image source:@"window_capture"];
         }
@@ -332,7 +341,7 @@ __attribute__((constructor)) static void _resolveScreenImageFunc(void) {
     if (imageData.length == 0) return nil;
 
     if (imageData.length <= kMCPScreenshotTargetBytes) {
-        NSLog(@"[witchan][ios-mcp] Screenshot captured via %@", source ?: @"unknown");
+        SCREEN_LOG(@"Screenshot captured via %@", source ?: @"unknown");
         return @{
             @"data": [imageData base64EncodedStringWithOptions:0],
             @"mimeType": @"image/jpeg",
@@ -350,7 +359,7 @@ __attribute__((constructor)) static void _resolveScreenImageFunc(void) {
 
     NSMutableDictionary *mutablePayload = [payload mutableCopy];
     mutablePayload[@"source"] = source ?: @"unknown";
-    NSLog(@"[witchan][ios-mcp] Screenshot captured via %@", mutablePayload[@"source"]);
+    SCREEN_LOG(@"Screenshot captured via %@", mutablePayload[@"source"]);
     return mutablePayload;
 }
 

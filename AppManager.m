@@ -8,6 +8,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import "IOSMCPPreferences.h"
+#import "MCPLogger.h"
 #import <sys/stat.h>
 
 typedef struct __SecCode const *SecStaticCodeRef;
@@ -29,7 +30,13 @@ extern CFStringRef kSecCodeInfoEntitlementsDict;
 - (id)_accessibilityFrontMostApplication;
 @end
 
-#define APP_LOG(fmt, ...) NSLog(@"[witchan][ios-mcp][App] " fmt, ##__VA_ARGS__)
+#define APP_LOG(fmt, ...) do { \
+    if ([MCPLogger isDebugLoggingEnabled]) { \
+        NSString *_iosmcp_log = [NSString stringWithFormat:(@"[App] " fmt), ##__VA_ARGS__]; \
+        NSLog(@"[witchan][ios-mcp]%@", _iosmcp_log); \
+        [MCPLogger logMessage:_iosmcp_log]; \
+    } \
+} while (0)
 
 static id MCPAppMsgSendObject(id target, SEL selector) {
     if (!target || !selector) return nil;
@@ -44,6 +51,67 @@ static id MCPAppMsgSendObjectArg(id target, SEL selector, id arg) {
 static BOOL MCPURLUsesSettingsScheme(NSURL *url) {
     NSString *scheme = url.scheme.lowercaseString ?: @"";
     return [scheme isEqualToString:@"prefs"] || [scheme isEqualToString:@"app-prefs"];
+}
+
+static NSString *MCPAppLogSafePath(NSString *path) {
+    if (![path isKindOfClass:[NSString class]] || path.length == 0) {
+        return @"-";
+    }
+    NSString *extension = path.pathExtension.lowercaseString;
+    if (extension.length > 0 && extension.length <= 12) {
+        return [NSString stringWithFormat:@"<path:.%@>", extension];
+    }
+    return @"<path>";
+}
+
+static NSString *MCPAppLogSafeURLString(NSString *urlString) {
+    if (![urlString isKindOfClass:[NSString class]] || urlString.length == 0) {
+        return @"-";
+    }
+    NSURLComponents *components = [NSURLComponents componentsWithString:urlString];
+    NSString *scheme = components.scheme.lowercaseString;
+    NSString *host = components.host;
+    if (scheme.length > 0 && host.length > 0) {
+        return [NSString stringWithFormat:@"<url:%@://%@>", scheme, host];
+    }
+    if (scheme.length > 0) {
+        return [NSString stringWithFormat:@"<url:%@>", scheme];
+    }
+    return @"<url>";
+}
+
+static NSString *MCPAppLogRedactedText(NSString *text) {
+    if (![text isKindOfClass:[NSString class]] || text.length == 0) {
+        return @"-";
+    }
+    NSString *result = [[text stringByReplacingOccurrencesOfString:@"\r" withString:@" "]
+                        stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+    NSArray<NSDictionary<NSString *, NSString *> *> *rules = @[
+        @{@"pattern": @"(?i)\\b[a-z][a-z0-9+.-]*://[^\\s\\\"'<>]+", @"replacement": @"<url>"},
+        @{@"pattern": @"(?i)\\b(prefs|app-prefs):[^\\s\\\"'<>]+", @"replacement": @"<url>"},
+        @{@"pattern": @"(/private)?/(var|tmp|Applications|User|Users|Library)[^\\s\\\"'<>]*", @"replacement": @"<path>"}
+    ];
+    for (NSDictionary<NSString *, NSString *> *rule in rules) {
+        NSError *regexError = nil;
+        NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:rule[@"pattern"]
+                                                                               options:0
+                                                                                 error:&regexError];
+        if (!regex || regexError) {
+            continue;
+        }
+        result = [regex stringByReplacingMatchesInString:result
+                                                 options:0
+                                                   range:NSMakeRange(0, result.length)
+                                            withTemplate:rule[@"replacement"]];
+    }
+    if (result.length > 256) {
+        result = [[result substringToIndex:256] stringByAppendingString:@"...<truncated>"];
+    }
+    return result;
+}
+
+static NSUInteger MCPAppLogUTF8Length(NSString *text) {
+    return [text isKindOfClass:[NSString class]] ? [text lengthOfBytesUsingEncoding:NSUTF8StringEncoding] : 0;
 }
 
 static BOOL MCPReadFileHeader(NSString *path, uint32_t *outMagic) {
@@ -346,7 +414,7 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
             *error = [NSString stringWithFormat:@"Launch request sent for %@, but it did not become frontmost within 5 seconds", bundleId];
         }
     }
-    APP_LOG(@"Launch not confirmed for %@, current frontmost=%@", bundleId, frontmostInfo);
+    APP_LOG(@"Launch not confirmed for %@, currentFrontmostBundleId=%@", bundleId, frontmostBundleId ?: @"-");
     return NO;
 }
 
@@ -598,7 +666,7 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
             BOOL opened = ((BOOL (*)(id, SEL, NSURL *))objc_msgSend)(app, legacyOpenSel, url);
 #pragma clang diagnostic pop
             if (opened) {
-                APP_LOG(@"Opened URL via UIApplication: %@", urlString);
+                APP_LOG(@"Opened URL via UIApplication: %@", MCPAppLogSafeURLString(urlString));
                 ok = YES;
                 errMsg = nil;
                 return;
@@ -633,7 +701,7 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
                 }
 
                 if (result) {
-                    APP_LOG(@"Opened URL via LSApplicationWorkspace: %@", urlString);
+                    APP_LOG(@"Opened URL via LSApplicationWorkspace: %@", MCPAppLogSafeURLString(urlString));
                     ok = YES;
                     errMsg = nil;
                     return;
@@ -645,7 +713,7 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
         }
 
         if (!ok && attemptedOpen && MCPWaitForURLOpenVerification(url, previousBundleId, 1.0)) {
-            APP_LOG(@"Verified URL open after dispatch: %@", urlString);
+            APP_LOG(@"Verified URL open after dispatch: %@", MCPAppLogSafeURLString(urlString));
             ok = YES;
             errMsg = nil;
             return;
@@ -667,7 +735,7 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
     // call returns. Verify the visible foreground transition once more outside
     // the main-thread open dispatch before reporting failure.
     if (!ok && attemptedOpen && MCPWaitForURLOpenVerification(url, previousBundleId, 2.0)) {
-        APP_LOG(@"Verified URL open after main dispatch returned: %@", urlString);
+        APP_LOG(@"Verified URL open after main dispatch returned: %@", MCPAppLogSafeURLString(urlString));
         ok = YES;
         errMsg = nil;
     }
@@ -1093,10 +1161,10 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
 
         NSString *failure = output.length > 0 ? output : spawnError;
         if (commandFailure) *commandFailure = failure ?: @"Unknown shell failure";
-        APP_LOG(@"Privileged shell command failed (spawnError=%@ exit=%d): %@",
-                spawnError ?: @"none",
+        APP_LOG(@"Privileged shell command failed (spawnError=%@ exit=%d commandBytes=%lu)",
+                MCPAppLogRedactedText(spawnError ?: @"none"),
                 exitCode,
-                command);
+                (unsigned long)MCPAppLogUTF8Length(command));
         return NO;
     };
 
@@ -1150,7 +1218,7 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
                 APP_LOG(@"Fakesigned %@ with %@ (%@)",
                         resolvedBundleId ?: bundleId ?: @"<unknown>",
                         ldidPath.lastPathComponent,
-                        signTarget);
+                        MCPAppLogSafePath(signTarget));
                 signedTarget = YES;
                 break;
             }
@@ -1158,12 +1226,12 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
             lastOutput = output;
             lastSpawnError = spawnError;
             lastExitCode = exitCode;
-            APP_LOG(@"mcp-ldid failed for %@ via %@ (spawnError=%@ exit=%d output=%@)",
-                    signTarget,
+            APP_LOG(@"mcp-ldid failed for %@ via %@ (spawnError=%@ exit=%d outputBytes=%lu)",
+                    MCPAppLogSafePath(signTarget),
                     ldidPath.lastPathComponent,
-                    spawnError ?: @"none",
+                    MCPAppLogRedactedText(spawnError ?: @"none"),
                     exitCode,
-                    output ?: @"");
+                    (unsigned long)MCPAppLogUTF8Length(output));
         }
 
         if (entitlementsPath.length > 0) {
@@ -1174,11 +1242,11 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
             if (signFailure) {
                 *signFailure = lastOutput.length > 0 ? lastOutput : (lastSpawnError ?: @"mcp-ldid failed");
             }
-            APP_LOG(@"mcp-ldid failed for %@ (spawnError=%@ exit=%d output=%@)",
-                    signTarget,
-                    lastSpawnError ?: @"none",
+            APP_LOG(@"mcp-ldid failed for %@ (spawnError=%@ exit=%d outputBytes=%lu)",
+                    MCPAppLogSafePath(signTarget),
+                    MCPAppLogRedactedText(lastSpawnError ?: @"none"),
                     lastExitCode,
-                    lastOutput ?: @"");
+                    (unsigned long)MCPAppLogUTF8Length(lastOutput));
             return NO;
         }
 
@@ -1289,10 +1357,10 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
                                                   &chmodExitCode,
                                                   &chmodError);
         if (!(chmodFinished && chmodExitCode == 0)) {
-            APP_LOG(@"chmod failed for Mach-O batch (spawnError=%@ exit=%d output=%@)",
-                    chmodError ?: @"none",
+            APP_LOG(@"chmod failed for Mach-O batch (spawnError=%@ exit=%d outputBytes=%lu)",
+                    MCPAppLogRedactedText(chmodError ?: @"none"),
                     chmodExitCode,
-                    chmodOutput ?: @"");
+                    (unsigned long)MCPAppLogUTF8Length(chmodOutput));
             if (error) *error = chmodOutput.length > 0 ? chmodOutput : (chmodError ?: @"Failed to set Mach-O permissions");
             return NO;
         }
@@ -1311,7 +1379,7 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
         if ([self fakesignInstalledAppForBundleId:bundleId installedAfter:installedAfter error:&lastError]) {
             return YES;
         }
-        APP_LOG(@"Fakesign attempt %lu failed for %@: %@", (unsigned long)(attempt + 1), bundleId ?: @"<unknown>", lastError ?: @"unknown error");
+        APP_LOG(@"Fakesign attempt %lu failed for %@: %@", (unsigned long)(attempt + 1), bundleId ?: @"<unknown>", MCPAppLogRedactedText(lastError ?: @"unknown error"));
         if (attempt < 2) {
             [NSThread sleepForTimeInterval:2.0];
         }
@@ -1346,7 +1414,7 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
         APP_LOG(@"Installing via %s%s: %@",
                 canUseMcpRoot ? "mcp-root -> " : "",
                 "mcp-roothelper",
-                ipaPath);
+                MCPAppLogSafePath(ipaPath));
         NSString *output = nil;
         NSString *spawnError = nil;
         int exitCode = -1;
@@ -1359,14 +1427,14 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
                                       &exitCode,
                                       &spawnError);
         if (finished && exitCode == 0) {
-            APP_LOG(@"mcp-roothelper succeeded: %@", output ?: @"");
+            APP_LOG(@"mcp-roothelper succeeded outputBytes=%lu", (unsigned long)MCPAppLogUTF8Length(output));
             return YES;
         }
 
-        APP_LOG(@"mcp-roothelper failed (spawnError=%@ exit=%d): %@",
-                spawnError ?: @"none",
+        APP_LOG(@"mcp-roothelper failed (spawnError=%@ exit=%d outputBytes=%lu)",
+                MCPAppLogRedactedText(spawnError ?: @"none"),
                 exitCode,
-                output ?: @"");
+                (unsigned long)MCPAppLogUTF8Length(output));
     }
 #endif
 
@@ -1387,7 +1455,7 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
 #endif
                 "",
                 "mcp-appinst",
-                ipaPath);
+                MCPAppLogSafePath(ipaPath));
         NSString *output = nil;
         NSString *spawnError = nil;
         int exitCode = -1;
@@ -1400,7 +1468,7 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
                                       &exitCode,
                                       &spawnError);
         if (finished && exitCode == 0) {
-            APP_LOG(@"mcp-appinst succeeded: %@", output ?: @"");
+            APP_LOG(@"mcp-appinst succeeded outputBytes=%lu", (unsigned long)MCPAppLogUTF8Length(output));
 #ifndef MCP_ROOTHIDE
             NSString *bundleId = ipaBundleId.length > 0 ? ipaBundleId : [self bundleIdFromAppInstOutput:output];
             [self retryFakesignInstalledAppForBundleId:bundleId installedAfter:installStartedAt];
@@ -1408,10 +1476,10 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
             return YES;
         }
 
-        APP_LOG(@"mcp-appinst failed (spawnError=%@ exit=%d): %@",
-                spawnError ?: @"none",
+        APP_LOG(@"mcp-appinst failed (spawnError=%@ exit=%d outputBytes=%lu)",
+                MCPAppLogRedactedText(spawnError ?: @"none"),
                 exitCode,
-                output ?: @"");
+                (unsigned long)MCPAppLogUTF8Length(output));
         // Fall through to LSApplicationWorkspace
     }
 
@@ -1458,7 +1526,7 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
                 }
 
                 if (result) {
-                    APP_LOG(@"Installed app from: %@ (options: %@)", ipaPath, options);
+                    APP_LOG(@"Installed app from: %@ (options: %@)", MCPAppLogSafePath(ipaPath), options);
                     ok = YES;
                     return;
                 }
@@ -1513,11 +1581,11 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
             NSString *bundleId = lines.lastObject;
             if (bundleId.length > 0) return bundleId;
         } else {
-            APP_LOG(@"mcp-roothelper --bundle-id failed for %@ (spawnError=%@ exit=%d output=%@)",
-                    ipaPath,
-                    spawnError ?: @"none",
+            APP_LOG(@"mcp-roothelper --bundle-id failed for %@ (spawnError=%@ exit=%d outputBytes=%lu)",
+                    MCPAppLogSafePath(ipaPath),
+                    MCPAppLogRedactedText(spawnError ?: @"none"),
                     exitCode,
-                    output ?: @"");
+                    (unsigned long)MCPAppLogUTF8Length(output));
         }
     }
 #endif
@@ -1541,17 +1609,17 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
             NSString *bundleId = lines.lastObject;
             if (bundleId.length > 0) return bundleId;
         } else {
-            APP_LOG(@"mcp-appinst --bundle-id failed for %@ (spawnError=%@ exit=%d output=%@)",
-                    ipaPath,
-                    spawnError ?: @"none",
+            APP_LOG(@"mcp-appinst --bundle-id failed for %@ (spawnError=%@ exit=%d outputBytes=%lu)",
+                    MCPAppLogSafePath(ipaPath),
+                    MCPAppLogRedactedText(spawnError ?: @"none"),
                     exitCode,
-                    output ?: @"");
+                    (unsigned long)MCPAppLogUTF8Length(output));
         }
     }
 
     NSString *unzipPath = MCPResolvedJailbreakPath(@"/usr/bin/unzip");
     if (![[NSFileManager defaultManager] isExecutableFileAtPath:unzipPath]) {
-        APP_LOG(@"unzip not found, skipping bundle ID extraction for %@", ipaPath);
+        APP_LOG(@"unzip not found, skipping bundle ID extraction for %@", MCPAppLogSafePath(ipaPath));
         return nil;
     }
 
@@ -1571,11 +1639,11 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
                                   &exitCode,
                                   &spawnError);
     if (!finished || exitCode != 0) {
-        APP_LOG(@"unzip failed for %@ (spawnError=%@ exit=%d output=%@)",
-                ipaPath,
-                spawnError ?: @"none",
+        APP_LOG(@"unzip failed for %@ (spawnError=%@ exit=%d outputBytes=%lu)",
+                MCPAppLogSafePath(ipaPath),
+                MCPAppLogRedactedText(spawnError ?: @"none"),
                 exitCode,
-                output ?: @"");
+                (unsigned long)MCPAppLogUTF8Length(output));
         [[NSFileManager defaultManager] removeItemAtPath:tmpDir error:nil];
         return nil;
     }

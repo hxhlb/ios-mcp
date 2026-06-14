@@ -6,8 +6,15 @@
 #import <stdint.h>
 #import <sys/types.h>
 #import <unistd.h>
+#import "MCPLogger.h"
 
-#define TI_LOG(fmt, ...) NSLog(@"[witchan][ios-mcp][TextInput] " fmt, ##__VA_ARGS__)
+#define TI_LOG(fmt, ...) do { \
+    if ([MCPLogger isDebugLoggingEnabled]) { \
+        NSString *_iosmcp_log = [NSString stringWithFormat:(@"[TextInput] " fmt), ##__VA_ARGS__]; \
+        NSLog(@"[witchan][ios-mcp]%@", _iosmcp_log); \
+        [MCPLogger logMessage:_iosmcp_log]; \
+    } \
+} while (0)
 
 // Keep this aligned with HIDManager.m. iOS filters synthetic events by sender
 // metadata; this sender is already proven by the touch/button path.

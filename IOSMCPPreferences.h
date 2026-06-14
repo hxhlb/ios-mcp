@@ -6,6 +6,7 @@
 #define IOS_MCP_DEFAULT_PORT 8090
 #define IOS_MCP_PREFERENCES_DOMAIN @"com.witchan.ios-mcp.preferences"
 #define IOS_MCP_ENABLED_PREFERENCE_KEY @"enabled"
+#define IOS_MCP_DEBUG_LOGGING_PREFERENCE_KEY @"debugLoggingEnabled"
 #define IOS_MCP_DARWIN_NOTIFICATION_START CFSTR("com.witchan.ios-mcp.control/start")
 #define IOS_MCP_DARWIN_NOTIFICATION_STOP CFSTR("com.witchan.ios-mcp.control/stop")
 

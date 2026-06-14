@@ -1,4 +1,5 @@
 #import "AccessibilityManager.h"
+#import "MCPLogger.h"
 #import "MCPAXQueryContext.h"
 #import "MCPAXAttributeBridge.h"
 #import "MCPAXNodeSource.h"
@@ -109,7 +110,13 @@ static id MCPMsgSendObject(id target, SEL selector) {
     return ((id (*)(id, SEL))objc_msgSend)(target, selector);
 }
 
-#define AX_LOG(fmt, ...) NSLog(@"[witchan][ios-mcp][AX] " fmt, ##__VA_ARGS__)
+#define AX_LOG(fmt, ...) do { \
+    if ([MCPLogger isDebugLoggingEnabled]) { \
+        NSString *_iosmcp_log = [NSString stringWithFormat:(@"[AX] " fmt), ##__VA_ARGS__]; \
+        NSLog(@"[witchan][ios-mcp]%@", _iosmcp_log); \
+        [MCPLogger logMessage:_iosmcp_log]; \
+    } \
+} while (0)
 static const BOOL MCPEnableAXParameterizedHitTest = YES;
 static const BOOL MCPEnableAXUIClientBootstrap = YES;
 #pragma mark - Geometry Helpers

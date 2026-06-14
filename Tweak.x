@@ -1,7 +1,16 @@
 #import <UIKit/UIKit.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import "MCPServer.h"
+#import "MCPLogger.h"
 #import "IOSMCPPreferences.h"
+
+#define IOS_MCP_LOG(fmt, ...) do { \
+    if ([MCPLogger isDebugLoggingEnabled]) { \
+        NSString *message = [NSString stringWithFormat:(fmt), ##__VA_ARGS__]; \
+        NSLog(@"[witchan][ios-mcp] %@", message); \
+        [MCPLogger logMessage:message]; \
+    } \
+} while (0)
 
 static BOOL ios_mcp_enabled_preference(void) {
     CFPropertyListRef value = CFPreferencesCopyAppValue((__bridge CFStringRef)IOS_MCP_ENABLED_PREFERENCE_KEY,
@@ -61,14 +70,14 @@ static void ios_mcp_handle_control_notification(CFNotificationCenterRef center,
     if (CFEqual(name, IOS_MCP_DARWIN_NOTIFICATION_START)) {
         ios_mcp_write_enabled_preference(YES);
         ios_mcp_start_server();
-        NSLog(@"[witchan][ios-mcp] Received start request from Settings");
+        IOS_MCP_LOG(@"Received start request from Settings");
         return;
     }
 
     if (CFEqual(name, IOS_MCP_DARWIN_NOTIFICATION_STOP)) {
         ios_mcp_write_enabled_preference(NO);
         ios_mcp_stop_server();
-        NSLog(@"[witchan][ios-mcp] Received stop request from Settings");
+        IOS_MCP_LOG(@"Received stop request from Settings");
     }
 }
 
@@ -78,26 +87,26 @@ static void ios_mcp_autostart_if_needed(NSString *reason) {
     }
 
     if (!ios_mcp_enabled_preference()) {
-        NSLog(@"[witchan][ios-mcp] Auto-start skipped (%@): disabled in Settings", reason ?: @"unknown");
+        IOS_MCP_LOG(@"Auto-start skipped (%@): disabled in Settings", reason ?: @"unknown");
         return;
     }
 
     MCPServer *server = [MCPServer sharedInstance];
     if (server.isRunning) {
-        NSLog(@"[witchan][ios-mcp] Auto-start skipped (%@): already running on port %d",
-              reason ?: @"unknown",
-              server.port);
+        IOS_MCP_LOG(@"Auto-start skipped (%@): already running on port %d",
+                    reason ?: @"unknown",
+                    server.port);
         return;
     }
 
-    NSLog(@"[witchan][ios-mcp] Auto-start attempt (%@) on port %d...",
-          reason ?: @"unknown",
-          IOS_MCP_DEFAULT_PORT);
+    IOS_MCP_LOG(@"Auto-start attempt (%@) on port %d...",
+                reason ?: @"unknown",
+                IOS_MCP_DEFAULT_PORT);
     ios_mcp_start_server();
 
     if (!server.isRunning) {
-        NSLog(@"[witchan][ios-mcp] Auto-start attempt (%@) did not start server; later retry may recover",
-              reason ?: @"unknown");
+        IOS_MCP_LOG(@"Auto-start attempt (%@) did not start server; later retry may recover",
+                    reason ?: @"unknown");
     }
 }
 
@@ -145,7 +154,7 @@ static void ios_mcp_register_lifecycle_notifications(void) {
                         object:nil
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(__unused NSNotification *notification) {
-        NSLog(@"[witchan][ios-mcp] UIApplicationDidFinishLaunchingNotification observed");
+        IOS_MCP_LOG(@"UIApplicationDidFinishLaunchingNotification observed");
         ios_mcp_schedule_bootstrap_autostart(@"UIApplicationDidFinishLaunching");
     }];
 
@@ -153,7 +162,7 @@ static void ios_mcp_register_lifecycle_notifications(void) {
                         object:nil
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(__unused NSNotification *notification) {
-        NSLog(@"[witchan][ios-mcp] UIApplicationDidBecomeActiveNotification observed");
+        IOS_MCP_LOG(@"UIApplicationDidBecomeActiveNotification observed");
         ios_mcp_schedule_autostart_attempt(@"UIApplicationDidBecomeActive", 0.1);
     }];
 }
@@ -176,7 +185,7 @@ static void ios_mcp_register_control_notifications(void) {
 
 // Log immediately when dylib is loaded into process
 __attribute__((constructor)) static void ios_mcp_init(void) {
-    NSLog(@"[witchan][ios-mcp] dylib loaded into process: %@", [[NSProcessInfo processInfo] processName]);
+    IOS_MCP_LOG(@"dylib loaded into process: %@", [[NSProcessInfo processInfo] processName]);
     ios_mcp_register_control_notifications();
 
     if (ios_mcp_is_springboard_process()) {
@@ -199,7 +208,7 @@ __attribute__((constructor)) static void ios_mcp_init(void) {
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
 
-    NSLog(@"[witchan][ios-mcp] SpringBoard applicationDidFinishLaunching fired");
+    IOS_MCP_LOG(@"SpringBoard applicationDidFinishLaunching fired");
 
     ios_mcp_schedule_bootstrap_autostart(@"SpringBoard.applicationDidFinishLaunching");
 }

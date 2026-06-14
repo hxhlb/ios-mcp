@@ -4,8 +4,15 @@
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
 #import <objc/message.h>
+#import "MCPLogger.h"
 
-#define MCP_AX_BRIDGE_LOG(fmt, ...) NSLog(@"[witchan][ios-mcp][AXBridge] " fmt, ##__VA_ARGS__)
+#define MCP_AX_BRIDGE_LOG(fmt, ...) do { \
+    if ([MCPLogger isDebugLoggingEnabled]) { \
+        NSString *_iosmcp_log = [NSString stringWithFormat:(@"[AXBridge] " fmt), ##__VA_ARGS__]; \
+        NSLog(@"[witchan][ios-mcp]%@", _iosmcp_log); \
+        [MCPLogger logMessage:_iosmcp_log]; \
+    } \
+} while (0)
 
 typedef struct {
     BOOL available;

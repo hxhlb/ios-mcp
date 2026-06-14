@@ -3,8 +3,15 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import "MCPLogger.h"
 
-#define HID_LOG(fmt, ...) NSLog(@"[witchan][ios-mcp][HID] " fmt, ##__VA_ARGS__)
+#define HID_LOG(fmt, ...) do { \
+    if ([MCPLogger isDebugLoggingEnabled]) { \
+        NSString *_iosmcp_log = [NSString stringWithFormat:(@"[HID] " fmt), ##__VA_ARGS__]; \
+        NSLog(@"[witchan][ios-mcp]%@", _iosmcp_log); \
+        [MCPLogger logMessage:_iosmcp_log]; \
+    } \
+} while (0)
 
 static uint64_t _touchSenderID = 0x8000000817319372;
 static double _deviceScreenWidth = 0;

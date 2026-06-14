@@ -6,6 +6,7 @@
 #import "AccessibilityManager.h"
 #import "MCPProcessUtil.h"
 #import "TextInputManager.h"
+#import "MCPLogger.h"
 #import <UIKit/UIKit.h>
 #import <sys/socket.h>
 #import <netinet/in.h>
@@ -24,13 +25,19 @@
 
 #define MCP_PROTOCOL_VERSION @"2025-03-26"
 #define MCP_SERVER_NAME      @"ios-mcp"
-#define MCP_SERVER_VERSION   @"1.1.1"
+#define MCP_SERVER_VERSION   @"1.1.2"
 #define HTTP_BUF_SIZE        (256 * 1024)
 #define MCP_MAX_CHUNK_LINE   (8 * 1024)
 #define MCP_UPLOAD_DIR       @"/tmp/ios-mcp-uploads"
 #define MCP_MAX_UPLOAD_BYTES (500LL * 1024LL * 1024LL)
 #define MCP_UPLOAD_CHUNK     (64 * 1024)
-#define MCP_LOG(fmt, ...)    NSLog(@"[witchan][ios-mcp] " fmt, ##__VA_ARGS__)
+#define MCP_LOG(fmt, ...) do { \
+    if ([MCPLogger isDebugLoggingEnabled]) { \
+        NSString *message = [NSString stringWithFormat:(fmt), ##__VA_ARGS__]; \
+        NSLog(@"[witchan][ios-mcp] %@", message); \
+        [MCPLogger logMessage:message]; \
+    } \
+} while (0)
 
 static BOOL MCPNumberFromArgs(NSDictionary *args, NSString *key, double defaultValue, BOOL required, double *outValue, NSString **outError) {
     id value = args[key];
@@ -114,6 +121,23 @@ static NSString *MCPBasePath(NSString *path) {
     NSRange query = [path rangeOfString:@"?"];
     if (query.location == NSNotFound) return path;
     return [path substringToIndex:query.location];
+}
+
+static NSString *MCPLogSafeFileName(NSString *fileName) {
+    if (![fileName isKindOfClass:[NSString class]] || fileName.length == 0) {
+        return @"-";
+    }
+    NSString *extension = fileName.pathExtension.lowercaseString;
+    if (extension.length > 0 && extension.length <= 12) {
+        return [NSString stringWithFormat:@"<file:.%@>", extension];
+    }
+    return @"<file>";
+}
+
+static NSString *MCPNextLogRequestId(void) {
+    static unsigned long long counter = 0;
+    unsigned long long seq = __sync_add_and_fetch(&counter, 1);
+    return [NSString stringWithFormat:@"%d-%llu", getpid(), seq];
 }
 
 static BOOL MCPWriteAllToFD(int fd, const void *bytes, size_t length) {
@@ -414,13 +438,14 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                        contentLength:(NSInteger)contentLength
                          initialBody:(const char *)initialBody
                    initialBodyLength:(ssize_t)initialBodyLength
-                        clientSocket:(int)clientSocket;
+                        clientSocket:(int)clientSocket
+                         requestLogId:(NSString *)requestLogId;
 - (NSData *)readChunkedMCPBodyFromSocket:(int)clientSocket
                              initialBody:(const char *)initialBody
                        initialBodyLength:(ssize_t)initialBodyLength
                              errorStatus:(int *)errorStatus
                             errorMessage:(NSString **)errorMessage;
-- (void)handleMCPRequest:(NSData *)bodyData clientSocket:(int)clientSocket;
+- (void)handleMCPRequest:(NSData *)bodyData clientSocket:(int)clientSocket requestLogId:(NSString *)requestLogId;
 - (NSDictionary *)routeMCPRequest:(NSDictionary *)request;
 - (NSDictionary *)handleInitialize:(id)reqId;
 - (NSDictionary *)handleToolsList:(id)reqId;
@@ -466,11 +491,11 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
 - (NSDictionary *)mcpSuccess:(id)reqId text:(NSString *)text;
 - (NSDictionary *)mcpSuccess:(id)reqId text:(NSString *)text isError:(BOOL)isError;
 - (NSDictionary *)mcpError:(id)reqId code:(NSInteger)code message:(NSString *)message;
-- (void)sendJSONResponse:(int)socket status:(int)status body:(NSDictionary *)body;
-- (void)sendErrorResponse:(int)socket status:(int)status message:(NSString *)message;
-- (void)sendMethodNotAllowedResponse:(int)socket allowedMethods:(NSString *)allowedMethods message:(NSString *)message;
-- (void)sendEmptyResponse:(int)socket status:(int)status;
-- (void)writeAll:(int)socket data:(NSData *)data;
+- (void)sendJSONResponse:(int)socket status:(int)status body:(NSDictionary *)body requestLogId:(NSString *)requestLogId;
+- (void)sendErrorResponse:(int)socket status:(int)status message:(NSString *)message requestLogId:(NSString *)requestLogId;
+- (void)sendMethodNotAllowedResponse:(int)socket allowedMethods:(NSString *)allowedMethods message:(NSString *)message requestLogId:(NSString *)requestLogId;
+- (void)sendEmptyResponse:(int)socket status:(int)status requestLogId:(NSString *)requestLogId;
+- (void)writeAll:(int)socket data:(NSData *)data requestLogId:(NSString *)requestLogId;
 @end
 
 @implementation MCPServer {
@@ -572,6 +597,9 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
 #pragma mark - HTTP Handling
 
 - (void)handleClient:(int)clientSocket {
+    NSDate *requestStart = [NSDate date];
+    NSString *requestLogId = MCPNextLogRequestId();
+
     // Set read timeout
     struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
     setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -598,7 +626,11 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
     }
 
     if (headerEnd < 0) {
-        [self sendErrorResponse:clientSocket status:400 message:@"Bad Request"];
+        [MCPLogger log:@"http_request_failed req=%@ sock=%d stage=headers error=bad_request durationMs=%.0f",
+         requestLogId,
+         clientSocket,
+         [[NSDate date] timeIntervalSinceDate:requestStart] * 1000.0];
+        [self sendErrorResponse:clientSocket status:400 message:@"Bad Request" requestLogId:requestLogId];
         free(buffer);
         close(clientSocket);
         return;
@@ -638,13 +670,24 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
 
     ssize_t bodyReceived = totalRead - headerEnd;
     NSString *basePath = MCPBasePath(path);
+    BOOL suppressSuccessfulHealthLog = [method isEqualToString:@"GET"] && [basePath isEqualToString:@"/health"];
+    if (!suppressSuccessfulHealthLog) {
+        [MCPLogger log:@"http_request req=%@ sock=%d method=%@ path=%@ contentLength=%ld transferEncoding=%@ initialBodyBytes=%ld",
+         requestLogId,
+         clientSocket,
+         method ?: @"<nil>",
+         basePath ?: @"<nil>",
+         (long)contentLength,
+         transferEncoding.length ? transferEncoding : @"identity",
+         (long)MAX((ssize_t)0, bodyReceived)];
+    }
 
     // Route request
     if ([method isEqualToString:@"POST"] && [basePath isEqualToString:@"/mcp"]) {
         NSString *expect = [headers[@"expect"] lowercaseString] ?: @"";
         if ([expect containsString:@"100-continue"]) {
             NSData *continueData = [@"HTTP/1.1 100 Continue\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding];
-            [self writeAll:clientSocket data:continueData];
+            [self writeAll:clientSocket data:continueData requestLogId:requestLogId];
         }
 
         if (chunkedBody) {
@@ -656,13 +699,13 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                                                       errorStatus:&errorStatus
                                                      errorMessage:&errorMessage];
             if (!bodyData) {
-                [self sendErrorResponse:clientSocket status:errorStatus message:errorMessage ?: @"Invalid chunked MCP request body"];
+                [self sendErrorResponse:clientSocket status:errorStatus message:errorMessage ?: @"Invalid chunked MCP request body" requestLogId:requestLogId];
                 free(buffer);
                 close(clientSocket);
                 return;
             }
 
-            [self handleMCPRequest:bodyData clientSocket:clientSocket];
+            [self handleMCPRequest:bodyData clientSocket:clientSocket requestLogId:requestLogId];
             free(buffer);
             close(clientSocket);
             return;
@@ -670,7 +713,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
 
         if (contentLength < 0) contentLength = 0;
         if (contentLength > HTTP_BUF_SIZE - headerEnd - 1) {
-            [self sendErrorResponse:clientSocket status:413 message:@"MCP request body too large"];
+            [self sendErrorResponse:clientSocket status:413 message:@"MCP request body too large" requestLogId:requestLogId];
             free(buffer);
             close(clientSocket);
             return;
@@ -685,30 +728,31 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         buffer[totalRead] = '\0';
 
         if (bodyReceived < contentLength) {
-            [self sendErrorResponse:clientSocket status:400 message:@"Incomplete MCP request body"];
+            [self sendErrorResponse:clientSocket status:400 message:@"Incomplete MCP request body" requestLogId:requestLogId];
             free(buffer);
             close(clientSocket);
             return;
         }
 
         NSData *bodyData = [NSData dataWithBytes:buffer + headerEnd length:MIN(bodyReceived, contentLength)];
-        [self handleMCPRequest:bodyData clientSocket:clientSocket];
+        [self handleMCPRequest:bodyData clientSocket:clientSocket requestLogId:requestLogId];
     } else if ([basePath isEqualToString:@"/mcp"]) {
-        [self sendMethodNotAllowedResponse:clientSocket allowedMethods:@"POST" message:@"Method Not Allowed"];
+        [self sendMethodNotAllowedResponse:clientSocket allowedMethods:@"POST" message:@"Method Not Allowed" requestLogId:requestLogId];
     } else if ([method isEqualToString:@"POST"] && [basePath isEqualToString:@"/upload_file"]) {
         [self handleUploadFileRequestPath:path
                                   headers:headers
                             contentLength:contentLength
                               initialBody:buffer + headerEnd
                         initialBodyLength:MAX((ssize_t)0, MIN(bodyReceived, (ssize_t)MAX(contentLength, 0)))
-                             clientSocket:clientSocket];
+                             clientSocket:clientSocket
+                              requestLogId:requestLogId];
     } else if ([basePath isEqualToString:@"/upload_file"]) {
-        [self sendMethodNotAllowedResponse:clientSocket allowedMethods:@"POST" message:@"Method Not Allowed"];
+        [self sendMethodNotAllowedResponse:clientSocket allowedMethods:@"POST" message:@"Method Not Allowed" requestLogId:requestLogId];
     } else if ([method isEqualToString:@"GET"] && [basePath isEqualToString:@"/health"]) {
         NSDictionary *health = @{@"status": @"ok", @"server": MCP_SERVER_NAME, @"version": MCP_SERVER_VERSION};
-        [self sendJSONResponse:clientSocket status:200 body:health];
+        [self sendJSONResponse:clientSocket status:200 body:health requestLogId:nil];
     } else {
-        [self sendErrorResponse:clientSocket status:404 message:@"Not Found"];
+        [self sendErrorResponse:clientSocket status:404 message:@"Not Found" requestLogId:requestLogId];
     }
 
     free(buffer);
@@ -825,19 +869,20 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                        contentLength:(NSInteger)contentLength
                          initialBody:(const char *)initialBody
                    initialBodyLength:(ssize_t)initialBodyLength
-                        clientSocket:(int)clientSocket {
+                        clientSocket:(int)clientSocket
+                         requestLogId:(NSString *)requestLogId {
     NSString *contentType = [headers[@"content-type"] lowercaseString] ?: @"";
     if ([contentType hasPrefix:@"multipart/form-data"]) {
-        [self sendErrorResponse:clientSocket status:415 message:@"multipart/form-data is not supported; upload raw file bytes with curl --data-binary @file"];
+        [self sendErrorResponse:clientSocket status:415 message:@"multipart/form-data is not supported; upload raw file bytes with curl --data-binary @file" requestLogId:requestLogId];
         return;
     }
 
     if (contentLength <= 0) {
-        [self sendErrorResponse:clientSocket status:411 message:@"Content-Length is required for file upload"];
+        [self sendErrorResponse:clientSocket status:411 message:@"Content-Length is required for file upload" requestLogId:requestLogId];
         return;
     }
     if ((long long)contentLength > MCP_MAX_UPLOAD_BYTES) {
-        [self sendErrorResponse:clientSocket status:413 message:@"File upload is too large"];
+        [self sendErrorResponse:clientSocket status:413 message:@"File upload is too large" requestLogId:requestLogId];
         return;
     }
 
@@ -847,7 +892,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
     NSString *expect = [headers[@"expect"] lowercaseString] ?: @"";
     if ([expect containsString:@"100-continue"]) {
         NSData *continueData = [@"HTTP/1.1 100 Continue\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding];
-        [self writeAll:clientSocket data:continueData];
+        [self writeAll:clientSocket data:continueData requestLogId:requestLogId];
     }
 
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -856,7 +901,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         withIntermediateDirectories:YES
                          attributes:@{NSFilePosixPermissions: @0777}
                               error:&dirError]) {
-        [self sendErrorResponse:clientSocket status:500 message:[NSString stringWithFormat:@"Failed to create upload directory: %@", dirError.localizedDescription ?: @"unknown"]];
+        [self sendErrorResponse:clientSocket status:500 message:[NSString stringWithFormat:@"Failed to create upload directory: %@", dirError.localizedDescription ?: @"unknown"] requestLogId:requestLogId];
         return;
     }
 
@@ -866,7 +911,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
     NSString *destPath = [MCP_UPLOAD_DIR stringByAppendingPathComponent:fileName];
     int fd = open(destPath.fileSystemRepresentation, O_CREAT | O_EXCL | O_WRONLY, 0644);
     if (fd < 0) {
-        [self sendErrorResponse:clientSocket status:500 message:[NSString stringWithFormat:@"Failed to open upload file: %s", strerror(errno)]];
+        [self sendErrorResponse:clientSocket status:500 message:[NSString stringWithFormat:@"Failed to open upload file: %s", strerror(errno)] requestLogId:requestLogId];
         return;
     }
 
@@ -912,43 +957,199 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
     if (!ok || remaining != 0) {
         [fm removeItemAtPath:destPath error:nil];
         NSString *message = writeFailed ? @"Failed to write uploaded file" : @"Incomplete file upload";
-        [self sendErrorResponse:clientSocket status:(writeFailed ? 500 : 400) message:message];
+        [MCPLogger log:@"file_upload req=%@ sock=%d ok=no reason=%@ filename=%@ bytesWritten=%lld expected=%ld",
+         requestLogId ?: @"-",
+         clientSocket,
+         writeFailed ? @"write_failed" : @"incomplete",
+         MCPLogSafeFileName(safeName),
+         bytesWritten,
+         (long)contentLength];
+        [self sendErrorResponse:clientSocket status:(writeFailed ? 500 : 400) message:message requestLogId:requestLogId];
         return;
     }
+
+    [MCPLogger log:@"file_upload req=%@ sock=%d ok=yes filename=%@ bytes=%lld path=<upload:%@>",
+     requestLogId ?: @"-",
+     clientSocket,
+     MCPLogSafeFileName(safeName),
+     bytesWritten,
+     uploadId ?: @"-"];
 
     NSDictionary *body = @{
         @"path": destPath,
         @"filename": safeName,
         @"size": @(bytesWritten)
     };
-    [self sendJSONResponse:clientSocket status:200 body:body];
+    [self sendJSONResponse:clientSocket status:200 body:body requestLogId:requestLogId];
 }
 
-- (void)handleMCPRequest:(NSData *)bodyData clientSocket:(int)clientSocket {
+static NSString *MCPRedactedLogText(NSString *s) {
+    if (![s isKindOfClass:[NSString class]] || s.length == 0) {
+        return @"-";
+    }
+
+    NSString *text = [[s stringByReplacingOccurrencesOfString:@"\r" withString:@" "]
+                      stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+    NSArray<NSDictionary<NSString *, NSString *> *> *rules = @[
+        @{@"pattern": @"(?i)\\b[a-z][a-z0-9+.-]*://[^\\s\\\"'<>]+", @"replacement": @"<url>"},
+        @{@"pattern": @"(?i)\\b(prefs|app-prefs):[^\\s\\\"'<>]+", @"replacement": @"<url>"},
+        @{@"pattern": @"(/private)?/(var|tmp|Applications|User|Users|Library)[^\\s\\\"'<>]*", @"replacement": @"<path>"}
+    ];
+
+    for (NSDictionary<NSString *, NSString *> *rule in rules) {
+        NSError *error = nil;
+        NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:rule[@"pattern"]
+                                                                               options:0
+                                                                                 error:&error];
+        if (!regex || error) {
+            continue;
+        }
+        text = [regex stringByReplacingMatchesInString:text
+                                               options:0
+                                                 range:NSMakeRange(0, text.length)
+                                          withTemplate:rule[@"replacement"]];
+    }
+    return text;
+}
+
+static NSString *MCPLogSnippet(NSString *s, NSUInteger maxLen) {
+    if (![s isKindOfClass:[NSString class]] || s.length == 0) {
+        return @"-";
+    }
+    NSString *t = MCPRedactedLogText(s);
+    if (t.length > maxLen) {
+        t = [[t substringToIndex:maxLen] stringByAppendingString:@"…"];
+    }
+    return t;
+}
+
+static NSString *MCPFirstResultText(NSDictionary *result) {
+    NSArray *content = [result[@"content"] isKindOfClass:[NSArray class]] ? result[@"content"] : nil;
+    for (id item in content) {
+        if ([item isKindOfClass:[NSDictionary class]] &&
+            [item[@"type"] isEqual:@"text"] &&
+            [item[@"text"] isKindOfClass:[NSString class]]) {
+            return item[@"text"];
+        }
+    }
+    return nil;
+}
+
+static BOOL MCPRunCommandResultTextHasExitCode(NSString *text) {
+    if (![text isKindOfClass:[NSString class]] || text.length == 0) {
+        return NO;
+    }
+    NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
+    if (!data) {
+        return NO;
+    }
+    id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    return [json isKindOfClass:[NSDictionary class]] && ((NSDictionary *)json)[@"exitCode"] != nil;
+}
+
+static NSString *MCPLogId(id reqId) {
+    if (!reqId || reqId == [NSNull null]) {
+        return @"-";
+    }
+    NSString *raw = nil;
+    if ([reqId isKindOfClass:[NSString class]]) {
+        raw = reqId;
+    } else if ([reqId respondsToSelector:@selector(stringValue)]) {
+        raw = [reqId stringValue];
+    } else {
+        raw = [reqId description];
+    }
+    return MCPLogSnippet(raw, 128);
+}
+
+- (void)handleMCPRequest:(NSData *)bodyData clientSocket:(int)clientSocket requestLogId:(NSString *)requestLogId {
+    NSDate *mcpStart = [NSDate date];
+    id logReqId = nil;
+    NSString *methodName = @"<parse_error>";
+    NSString *toolName = nil;
+
     @try {
         NSError *jsonError;
         id jsonObj = [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:&jsonError];
         if (jsonError || ![jsonObj isKindOfClass:[NSDictionary class]]) {
             NSDictionary *errResp = @{
                 @"jsonrpc": @"2.0",
-                @"id": [NSNull null],
-                @"error": @{@"code": @(-32700), @"message": @"Parse error"}
-            };
-            [self sendJSONResponse:clientSocket status:200 body:errResp];
+	                @"id": [NSNull null],
+	                @"error": @{@"code": @(-32700), @"message": @"Parse error"}
+	            };
+            [MCPLogger log:@"mcp_request req=%@ sock=%d id=- method=%@ tool=- response=error errorCode=-32700 errorMsg=Parse error durationMs=%.0f",
+             requestLogId ?: @"-",
+             clientSocket,
+             methodName,
+             [[NSDate date] timeIntervalSinceDate:mcpStart] * 1000.0];
+            [self sendJSONResponse:clientSocket status:200 body:errResp requestLogId:requestLogId];
             return;
         }
 
         NSDictionary *request = (NSDictionary *)jsonObj;
+        logReqId = request[@"id"];
+        methodName = [request[@"method"] isKindOfClass:[NSString class]] ? request[@"method"] : @"<missing>";
+        NSDictionary *params = [request[@"params"] isKindOfClass:[NSDictionary class]] ? request[@"params"] : nil;
+        if ([methodName isEqualToString:@"tools/call"]) {
+            toolName = [params[@"name"] isKindOfClass:[NSString class]] ? params[@"name"] : @"<missing>";
+        }
+
         NSDictionary *response = [self routeMCPRequest:request];
 
+        // 区分四种结果：notification / result(成功) / tool_error(isError 软失败，含锁屏拦截) /
+        // error(JSON-RPC 协议错误)，并记录失败原因，便于排查。成功结果不记内容以保护隐私。
+        NSString *responseKind = @"notification";
+        NSString *detail = @"";
+        if ([response[@"error"] isKindOfClass:[NSDictionary class]]) {
+            responseKind = @"error";
+            NSDictionary *err = response[@"error"];
+            detail = [NSString stringWithFormat:@" errorCode=%@ errorMsg=%@",
+                      err[@"code"] ?: @"?",
+                      MCPLogSnippet([err[@"message"] isKindOfClass:[NSString class]] ? err[@"message"] : nil, 256)];
+        } else if ([response[@"result"] isKindOfClass:[NSDictionary class]]) {
+            NSDictionary *result = response[@"result"];
+            if ([result[@"isError"] respondsToSelector:@selector(boolValue)] && [result[@"isError"] boolValue]) {
+                responseKind = @"tool_error";
+                NSString *errText = MCPFirstResultText(result);
+                // run_command 实际执行失败时，结果文本里含命令输出，已由独立的 run_command 日志行
+                // 记录 exitCode，这里不重复记录输出，避免把命令输出写进可分享日志；但锁屏拦截等
+                // 未真正执行的情况（不含 exitCode 字段）仍要记录原因。
+                if ([toolName isEqualToString:@"run_command"] &&
+                    MCPRunCommandResultTextHasExitCode(errText)) {
+                    detail = @" errorText=<see run_command line>";
+                } else {
+                    detail = [NSString stringWithFormat:@" errorText=%@", MCPLogSnippet(errText, 256)];
+                }
+            } else {
+                responseKind = @"result";
+            }
+        }
+        [MCPLogger log:@"mcp_request req=%@ sock=%d id=%@ method=%@ tool=%@ response=%@%@ durationMs=%.0f",
+         requestLogId ?: @"-",
+         clientSocket,
+         MCPLogId(request[@"id"]),
+         methodName ?: @"<nil>",
+         toolName ?: @"-",
+         responseKind,
+         detail,
+         [[NSDate date] timeIntervalSinceDate:mcpStart] * 1000.0];
+
         if (response) {
-            [self sendJSONResponse:clientSocket status:200 body:response];
+            [self sendJSONResponse:clientSocket status:200 body:response requestLogId:requestLogId];
         } else {
             // Notification — no response needed, but send 202
-            [self sendEmptyResponse:clientSocket status:202];
+            [self sendEmptyResponse:clientSocket status:202 requestLogId:requestLogId];
         }
     } @catch (NSException *exception) {
         MCP_LOG(@"Unhandled exception while processing MCP request: %@ - %@", exception.name, exception.reason);
+        [MCPLogger log:@"mcp_request req=%@ sock=%d id=%@ method=%@ tool=%@ response=error errorCode=-32000 errorMsg=%@ durationMs=%.0f",
+         requestLogId ?: @"-",
+         clientSocket,
+         MCPLogId(logReqId),
+         methodName ?: @"<exception>",
+         toolName ?: @"-",
+         MCPLogSnippet(exception.reason ?: exception.name ?: @"unknown", 256),
+         [[NSDate date] timeIntervalSinceDate:mcpStart] * 1000.0];
         NSDictionary *errResp = @{
             @"jsonrpc": @"2.0",
             @"id": [NSNull null],
@@ -957,7 +1158,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                 @"message": [NSString stringWithFormat:@"Internal server exception: %@", exception.reason ?: exception.name ?: @"unknown"]
             }
         };
-        [self sendJSONResponse:clientSocket status:200 body:errResp];
+        [self sendJSONResponse:clientSocket status:200 body:errResp requestLogId:requestLogId];
     }
 }
 
@@ -2576,7 +2777,16 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                                   &exitCode,
                                   &runError);
 
-    if (!finished && [runError hasPrefix:@"Command timed out"]) {
+    // 记录非敏感的执行结果（不记录命令本身/输出内容），便于排查失败与超时。
+    BOOL timedOut = !finished && [runError hasPrefix:@"Command timed out"];
+    [MCPLogger log:@"run_command finished=%@ timedOut=%@ exitCode=%d timeoutSec=%d outputBytes=%lu",
+     finished ? @"yes" : @"no",
+     timedOut ? @"yes" : @"no",
+     exitCode,
+     (int)timeoutSec,
+     (unsigned long)output.length];
+
+    if (timedOut) {
         return [self mcpSuccess:reqId text:runError isError:YES];
     }
 
@@ -2879,10 +3089,10 @@ static BOOL MCPSetSystemBrightness(CGFloat brightness) {
 
 #pragma mark - HTTP Response Helpers
 
-- (void)sendJSONResponse:(int)socket status:(int)status body:(NSDictionary *)body {
+- (void)sendJSONResponse:(int)socket status:(int)status body:(NSDictionary *)body requestLogId:(NSString *)requestLogId {
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
     if (!jsonData) {
-        [self sendErrorResponse:socket status:500 message:@"JSON serialization error"];
+        [self sendErrorResponse:socket status:500 message:@"JSON serialization error" requestLogId:requestLogId];
         return;
     }
 
@@ -2898,10 +3108,17 @@ static BOOL MCPSetSystemBrightness(CGFloat brightness) {
     NSMutableData *responseData = [NSMutableData dataWithData:[response dataUsingEncoding:NSUTF8StringEncoding]];
     [responseData appendData:jsonData];
 
-    [self writeAll:socket data:responseData];
+    if (requestLogId.length > 0) {
+        [MCPLogger log:@"http_response req=%@ sock=%d status=%d contentType=application/json bytes=%lu",
+         requestLogId,
+         socket,
+         status,
+         (unsigned long)responseData.length];
+    }
+    [self writeAll:socket data:responseData requestLogId:requestLogId];
 }
 
-- (void)sendErrorResponse:(int)socket status:(int)status message:(NSString *)message {
+- (void)sendErrorResponse:(int)socket status:(int)status message:(NSString *)message requestLogId:(NSString *)requestLogId {
     NSString *statusText;
     switch (status) {
         case 400: statusText = @"Bad Request"; break;
@@ -2928,10 +3145,18 @@ static BOOL MCPSetSystemBrightness(CGFloat brightness) {
     NSMutableData *responseData = [NSMutableData dataWithData:[header dataUsingEncoding:NSUTF8StringEncoding]];
     [responseData appendData:jsonData];
 
-    [self writeAll:socket data:responseData];
+    if (requestLogId.length > 0) {
+        [MCPLogger log:@"http_response req=%@ sock=%d status=%d contentType=application/json bytes=%lu error=%@",
+         requestLogId,
+         socket,
+         status,
+         (unsigned long)responseData.length,
+         MCPLogSnippet(message, 256)];
+    }
+    [self writeAll:socket data:responseData requestLogId:requestLogId];
 }
 
-- (void)sendMethodNotAllowedResponse:(int)socket allowedMethods:(NSString *)allowedMethods message:(NSString *)message {
+- (void)sendMethodNotAllowedResponse:(int)socket allowedMethods:(NSString *)allowedMethods message:(NSString *)message requestLogId:(NSString *)requestLogId {
     NSDictionary *body = @{@"error": message ?: @"Method Not Allowed"};
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
 
@@ -2947,10 +3172,17 @@ static BOOL MCPSetSystemBrightness(CGFloat brightness) {
     NSMutableData *responseData = [NSMutableData dataWithData:[header dataUsingEncoding:NSUTF8StringEncoding]];
     [responseData appendData:jsonData];
 
-    [self writeAll:socket data:responseData];
+    if (requestLogId.length > 0) {
+        [MCPLogger log:@"http_response req=%@ sock=%d status=405 contentType=application/json bytes=%lu allow=%@",
+         requestLogId,
+         socket,
+         (unsigned long)responseData.length,
+         allowedMethods ?: @"POST"];
+    }
+    [self writeAll:socket data:responseData requestLogId:requestLogId];
 }
 
-- (void)sendEmptyResponse:(int)socket status:(int)status {
+- (void)sendEmptyResponse:(int)socket status:(int)status requestLogId:(NSString *)requestLogId {
     NSString *response = [NSString stringWithFormat:
         @"HTTP/1.1 %d Accepted\r\n"
         @"Content-Length: 0\r\n"
@@ -2960,17 +3192,36 @@ static BOOL MCPSetSystemBrightness(CGFloat brightness) {
         status, _sessionId];
 
     NSData *data = [response dataUsingEncoding:NSUTF8StringEncoding];
-    [self writeAll:socket data:data];
+    if (requestLogId.length > 0) {
+        [MCPLogger log:@"http_response req=%@ sock=%d status=%d contentType=none bytes=%lu",
+         requestLogId,
+         socket,
+         status,
+         (unsigned long)data.length];
+    }
+    [self writeAll:socket data:data requestLogId:requestLogId];
 }
 
-- (void)writeAll:(int)socket data:(NSData *)data {
+- (void)writeAll:(int)socket data:(NSData *)data requestLogId:(NSString *)requestLogId {
     const uint8_t *bytes = data.bytes;
     NSUInteger remaining = data.length;
     NSUInteger offset = 0;
 
     while (remaining > 0) {
         ssize_t written = write(socket, bytes + offset, remaining);
-        if (written <= 0) break;
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written <= 0) {
+            int err = errno;
+            [MCPLogger log:@"socket_write_failed req=%@ sock=%d errno=%d error=%s remainingBytes=%lu",
+             requestLogId ?: @"-",
+             socket,
+             err,
+             strerror(err),
+             (unsigned long)remaining];
+            break;
+        }
         offset += written;
         remaining -= written;
     }
